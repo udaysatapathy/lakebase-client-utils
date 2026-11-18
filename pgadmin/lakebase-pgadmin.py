@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""Register a Lakebase Postgres endpoint in pgAdmin 4 with single sign-on.
+
+No token copying: pgAdmin's "Password exec command" runs a small generated
+script that asks the Databricks CLI for a fresh database credential each time
+pgAdmin connects. The CLI uses its existing browser sign-in (Entra SSO on Azure
+Databricks).
+
+What it does:
+  1. Looks up the endpoint host and your Postgres username with the Databricks CLI.
+  2. Writes a per-endpoint token script (~/.lakebase-pgadmin/*.sh or *.ps1).
+  3. Writes a pgAdmin server definition (JSON).
+  4. Backs up pgAdmin's config database and loads the server with pgAdmin's own
+     `setup.py load-servers` command (desktop mode).
+
+Requirements: Python 3.9+ (standard library only), the Databricks CLI signed in
+with `databricks auth login --profile <profile>`, and pgAdmin 4 desktop.
+
+Examples:
+  # Preview only; writes nothing
+  python3 lakebase-pgadmin.py --profile my-profile --project my-project --dry-run
+
+  # Register the project's default branch and its read-write endpoint
+  python3 lakebase-pgadmin.py --profile my-profile --project my-project
+
+  # Specific branch, and check that a credential can be fetched
+  python3 lakebase-pgadmin.py --profile my-profile --project my-project --branch dev --test-token
+
+  # Only write the JSON, for Tools > Import/Export Servers in pgAdmin
+  python3 lakebase-pgadmin.py --profile my-profile --project my-project --json-only
+
+Tested on macOS with pgAdmin 4 9.19 (2026-11-18). The Windows and Linux paths are
+untested.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+IS_WINDOWS = platform.system() == "Windows"
+IS_MAC = platform.system() == "Darwin"
+
+
+def fail(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run_cli(cli: str, args: list[str], profile: str) -> object:
+    cmd = [cli, *args, "--profile", profile, "-o", "json"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        fail(f"`{' '.join(cmd)}` failed:\n{detail}\n"
+             f"If the session expired, run: databricks auth login --profile {profile}")
+    return json.loads(result.stdout or "null")
+
+
+def as_list(payload: object, key: str) -> list[dict]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        return payload.get(key, []) or []
+    return []
+
+
+def short_id(resource_name: str) -> str:
+    return resource_name.rstrip("/").split("/")[-1]
+
+
+def resolve_target(cli: str, profile: str, project: str, branch: str | None,
+                   endpoint: str | None) -> tuple[str, str, str]:
+    """Return (endpoint resource name, host, branch id)."""
+    project_name = project if project.startswith("projects/") else f"projects/{project}"
+
+    branches = as_list(run_cli(cli, ["postgres", "list-branches", project_name], profile), "branches")
+    if not branches:
+        fail(f"no branches found in {project_name}")
+    if branch:
+        wanted = branch if branch.startswith("projects/") else f"{project_name}/branches/{branch}"
+        match = [b for b in branches if b.get("name") == wanted]
+        if not match:
+            fail(f"branch {wanted} not found. Available: {', '.join(short_id(b['name']) for b in branches)}")
+        branch_name = wanted
+    else:
+        default = [b for b in branches if (b.get("status") or {}).get("default")]
+        branch_name = (default or branches)[0]["name"]
+
+    endpoints = as_list(run_cli(cli, ["postgres", "list-endpoints", branch_name], profile), "endpoints")
+    if not endpoints:
+        fail(f"no endpoints found on {branch_name}")
+    if endpoint:
+        wanted = endpoint if endpoint.startswith("projects/") else f"{branch_name}/endpoints/{endpoint}"
+        match = [e for e in endpoints if e.get("name") == wanted]
+        if not match:
+            fail(f"endpoint {wanted} not found. Available: {', '.join(short_id(e['name']) for e in endpoints)}")
+        chosen = match[0]
+    else:
+        def endpoint_type(e: dict) -> str:
+            return (e.get("status") or {}).get("endpoint_type") or (e.get("spec") or {}).get("endpoint_type") or ""
+        read_write = [e for e in endpoints if endpoint_type(e) == "ENDPOINT_TYPE_READ_WRITE"]
+        chosen = (read_write or endpoints)[0]
+
+    host = ((chosen.get("status") or {}).get("hosts") or {}).get("host")
+    if not host:
+        fail(f"could not find a host for {chosen.get('name')}")
+    return chosen["name"], host, short_id(branch_name)
+
+
+def token_script(cli: str, endpoint_name: str, profile: str) -> tuple[str, str]:
+    """Return (file suffix, script body) for this platform."""
+    if IS_WINDOWS:
+        body = (
+            "# Generated by lakebase-pgadmin.py. Prints a fresh Lakebase database credential\n"
+            "# for pgAdmin's \"Password exec command\". Uses the Databricks CLI sign-in.\n"
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$credential = & '{cli}' postgres generate-database-credential '{endpoint_name}' "
+            f"--profile '{profile}' -o json | ConvertFrom-Json\n"
+            "[Console]::Out.Write($credential.token)\n"
+        )
+        return ".ps1", body
+
+    jq = shutil.which("jq")
+    if jq:
+        extract = f'"{jq}" -r .token'
+    else:
+        extract = (f'"{sys.executable}" -c '
+                   "'import json,sys; sys.stdout.write(json.load(sys.stdin)[\"token\"])'")
+    body = (
+        "#!/bin/bash\n"
+        "# Generated by lakebase-pgadmin.py. Prints a fresh Lakebase database credential\n"
+        "# for pgAdmin's \"Password exec command\". Uses the Databricks CLI sign-in.\n"
+        "set -euo pipefail\n"
+        f'"{cli}" postgres generate-database-credential "{endpoint_name}" \\\n'
+        f'  --profile "{profile}" -o json | {extract}\n'
+    )
+    return ".sh", body
+
+
+def exec_command(script_path: Path) -> str:
+    if IS_WINDOWS:
+        return f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{script_path}"'
+    return str(script_path)
+
+
+def find_pgadmin(python_override: str | None, setup_override: str | None) -> tuple[Path, Path] | None:
+    if python_override and setup_override:
+        return Path(python_override), Path(setup_override)
+    candidates: list[tuple[Path, Path]] = []
+    if IS_MAC:
+        app = Path("/Applications/pgAdmin 4.app/Contents")
+        for py in sorted(app.glob("Frameworks/Python.framework/Versions/3*/bin/python3*"), reverse=True):
+            if re.fullmatch(r"python3(\.\d+)?", py.name):
+                candidates.append((py, app / "Resources/web/setup.py"))
+    elif IS_WINDOWS:
+        for root in (Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "pgAdmin 4",
+                     Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "pgAdmin 4"):
+            candidates.append((root / "python" / "python.exe", root / "web" / "setup.py"))
+    else:
+        candidates.append((Path("/usr/pgadmin4/venv/bin/python3"), Path("/usr/pgadmin4/web/setup.py")))
+    for py, setup in candidates:
+        if py.exists() and setup.exists():
+            return py, setup
+    return None
+
+
+def default_sqlite_path() -> Path:
+    if IS_WINDOWS:
+        return Path(os.environ.get("APPDATA", "")) / "pgAdmin" / "pgadmin4.db"
+    return Path.home() / ".pgadmin" / "pgadmin4.db"
+
+
+def existing_server_names(py: Path, setup: Path, sqlite_path: Path) -> set[str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "servers.json"
+        result = subprocess.run([str(py), str(setup), "dump-servers", str(out), "--sqlite-path", str(sqlite_path)],
+                                cwd=setup.parent, capture_output=True, text=True)
+        if result.returncode != 0 or not out.exists():
+            return set()
+        servers = json.loads(out.read_text()).get("Servers", {})
+        return {s.get("Name", "") for s in servers.values()}
+
+
+def pgadmin_running() -> bool:
+    try:
+        if IS_WINDOWS:
+            out = subprocess.run(["tasklist"], capture_output=True, text=True).stdout
+            return "pgAdmin4" in out or "pgAdmin 4" in out
+        return subprocess.run(["pgrep", "-f", "pgAdmin 4"], capture_output=True).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--profile", required=True, help="Databricks CLI profile (from ~/.databrickscfg)")
+    parser.add_argument("--project", required=True, help="Lakebase project ID or projects/<id>")
+    parser.add_argument("--branch", help="Branch ID (default: the project's default branch)")
+    parser.add_argument("--endpoint", help="Endpoint ID (default: the branch's read-write endpoint)")
+    parser.add_argument("--database", default="databricks_postgres", help="Maintenance database")
+    parser.add_argument("--username", help="Postgres role (default: your Databricks user name)")
+    parser.add_argument("--name", help="Server name shown in pgAdmin")
+    parser.add_argument("--group", default="Lakebase", help="pgAdmin server group (default: Lakebase)")
+    parser.add_argument("--expiration", type=int, default=3000,
+                        help="Seconds before pgAdmin fetches a new credential; keep under 3600 (default 3000)")
+    parser.add_argument("--scripts-dir", default=str(Path.home() / ".lakebase-pgadmin"),
+                        help="Where token scripts are written (default ~/.lakebase-pgadmin)")
+    parser.add_argument("--cli", help="Path to the databricks CLI (default: found on PATH)")
+    parser.add_argument("--sqlite-path", help="pgAdmin config database (default: desktop-mode location)")
+    parser.add_argument("--pgadmin-python", help="pgAdmin's bundled Python, if not auto-detected")
+    parser.add_argument("--pgadmin-setup", help="pgAdmin's web/setup.py, if not auto-detected")
+    parser.add_argument("--json-only", action="store_true", help="Write the server JSON and stop")
+    parser.add_argument("--test-token", action="store_true",
+                        help="Run the token script once and report success (never prints the token)")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would happen; write nothing")
+    args = parser.parse_args()
+
+    if args.expiration >= 3600:
+        fail("--expiration must be under 3600 seconds; Lakebase credentials last one hour")
+
+    cli = args.cli or shutil.which("databricks")
+    if not cli:
+        fail("Databricks CLI not found. Install it or pass --cli /path/to/databricks")
+    # Keep the PATH location (e.g. /opt/homebrew/bin/databricks), not the resolved
+    # symlink target, so the token script survives CLI upgrades.
+    cli = str(Path(cli).absolute())
+
+    username = args.username or (run_cli(cli, ["current-user", "me"], args.profile) or {}).get("userName")
+    if not username:
+        fail("could not determine your Databricks user name; pass --username")
+
+    endpoint_name, host, branch_id = resolve_target(cli, args.profile, args.project, args.branch, args.endpoint)
+    project_id = short_id(args.project)
+    endpoint_id = short_id(endpoint_name)
+    server_name = args.name or f"{project_id} / {branch_id} ({args.profile})"
+
+    suffix, body = token_script(cli, endpoint_name, args.profile)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{args.profile}__{project_id}__{branch_id}__{endpoint_id}")
+    scripts_dir = Path(args.scripts_dir).expanduser()
+    script_path = scripts_dir / f"{safe}{suffix}"
+    json_path = scripts_dir / f"{safe}.servers.json"
+
+    server = {
+        "Name": server_name,
+        "Group": args.group,
+        "Host": host,
+        "Port": 5432,
+        "MaintenanceDB": args.database,
+        "Username": username,
+        "KerberosAuthentication": False,
+        "ConnectionParameters": {"sslmode": "require", "connect_timeout": "30"},
+        "PasswordExecCommand": exec_command(script_path),
+        "PasswordExecExpiration": args.expiration,
+        "Comment": f"Lakebase {endpoint_name} via Databricks CLI profile {args.profile}. "
+                   f"Managed by lakebase-pgadmin.py.",
+    }
+    servers_json = {"Servers": {"1": server}}
+
+    print(f"Endpoint:      {endpoint_name}")
+    print(f"Host:          {host}")
+    print(f"Username:      {username}")
+    print(f"pgAdmin name:  {args.group} / {server_name}")
+    print(f"Token script:  {script_path}")
+    print(f"Exec command:  {server['PasswordExecCommand']}")
+
+    if args.dry_run:
+        print("\nDry run. Server definition that would be loaded:")
+        print(json.dumps(servers_json, indent=2))
+        return
+
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(body)
+    if not IS_WINDOWS:
+        script_path.chmod(stat.S_IRWXU)  # 700: owner only
+    json_path.write_text(json.dumps(servers_json, indent=2))
+    print(f"\nWrote {script_path}\nWrote {json_path}")
+
+    if args.test_token:
+        cmd = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)]
+               if IS_WINDOWS else [str(script_path)])
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        token = result.stdout.strip()
+        if result.returncode != 0 or len(token) < 100:
+            fail(f"token script did not return a credential:\n{result.stderr.strip()}")
+        print(f"Token check:   OK ({len(token)} characters; not shown)")
+
+    if args.json_only:
+        print("\nImport it in pgAdmin with Tools > Import/Export Servers.")
+        return
+
+    found = find_pgadmin(args.pgadmin_python, args.pgadmin_setup)
+    if not found:
+        print("\npgAdmin's setup.py wasn't found. Import the JSON with Tools > Import/Export Servers,\n"
+              "or pass --pgadmin-python and --pgadmin-setup.")
+        return
+    py, setup = found
+    sqlite_path = Path(args.sqlite_path).expanduser() if args.sqlite_path else default_sqlite_path()
+    if not sqlite_path.exists():
+        fail(f"pgAdmin config database not found at {sqlite_path}. Start pgAdmin once, or pass --sqlite-path.")
+
+    if server_name in existing_server_names(py, setup, sqlite_path):
+        print(f"\nA server named '{server_name}' already exists in pgAdmin, so it wasn't added again.\n"
+              "The token script was refreshed. Delete the server in pgAdmin to re-register it, or pass --name.")
+        return
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = sqlite_path.with_name(f"{sqlite_path.name}.bak-{stamp}")
+    shutil.copy2(sqlite_path, backup)
+    print(f"Backed up pgAdmin config to {backup}")
+
+    result = subprocess.run([str(py), str(setup), "load-servers", str(json_path), "--sqlite-path", str(sqlite_path)],
+                            cwd=setup.parent, capture_output=True, text=True)
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        fail(f"pgAdmin load-servers failed:\n{output}")
+    print(output.splitlines()[-1] if output else "Loaded.")
+
+    if pgadmin_running():
+        print("\npgAdmin is running. Restart it, or refresh the Object Explorer, to see the new server.")
+    print("Connect from pgAdmin. It will fetch a credential through the CLI; no password needed.")
+
+
+if __name__ == "__main__":
+    main()
