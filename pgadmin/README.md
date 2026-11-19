@@ -34,7 +34,7 @@ The tool won't add a server whose name already exists. It never uses `load-serve
 
 ## Option 2: import a server file
 
-Use this if you'd rather add the server in pgAdmin yourself, if the utility can't find pgAdmin, or if you're preparing a file for someone else.
+Use this if you'd rather add the server in pgAdmin yourself, or if the utility can't find pgAdmin. The server file contains your user name and the full path to your own token script, so it only works on your machine. Each user generates their own.
 
 1. Write the server file. This step doesn't change pgAdmin:
 
