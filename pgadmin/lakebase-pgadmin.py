@@ -202,6 +202,20 @@ def pgadmin_running() -> bool:
         return False
 
 
+def print_import_steps(json_path: Path, group: str) -> None:
+    hidden_note = ""
+    if not IS_WINDOWS and any(part.startswith(".") for part in json_path.parent.parts):
+        hidden_note = ("     The folder is hidden, so the file picker may not show it. If so, copy the file first:\n"
+                       f"       cp \"{json_path}\" ~/Downloads/\n")
+    print("\nTo add the server in pgAdmin:\n"
+          "  1. Open Tools > Import/Export Servers and select Import.\n"
+          f"  2. Click the folder icon next to Filename and choose:\n       {json_path}\n"
+          f"{hidden_note}"
+          "  3. Leave 'Remove all the existing servers?' unticked, or pgAdmin deletes your other servers.\n"
+          "  4. Click Next, tick the server, click Next, then Finish.\n"
+          f"  5. Open the '{group}' group in the Object Explorer and connect. No password is needed.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--profile", required=True, help="Databricks CLI profile (from ~/.databrickscfg)")
@@ -220,7 +234,8 @@ def main() -> None:
     parser.add_argument("--sqlite-path", help="pgAdmin config database (default: desktop-mode location)")
     parser.add_argument("--pgadmin-python", help="pgAdmin's bundled Python, if not auto-detected")
     parser.add_argument("--pgadmin-setup", help="pgAdmin's web/setup.py, if not auto-detected")
-    parser.add_argument("--json-only", action="store_true", help="Write the server JSON and stop")
+    parser.add_argument("--json-only", action="store_true",
+                        help="Write the token script and server file, print import steps, and stop")
     parser.add_argument("--test-token", action="store_true",
                         help="Run the token script once and report success (never prints the token)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen; write nothing")
@@ -296,13 +311,14 @@ def main() -> None:
         print(f"Token check:   OK ({len(token)} characters; not shown)")
 
     if args.json_only:
-        print("\nImport it in pgAdmin with Tools > Import/Export Servers.")
+        print_import_steps(json_path, args.group)
         return
 
     found = find_pgadmin(args.pgadmin_python, args.pgadmin_setup)
     if not found:
-        print("\npgAdmin's setup.py wasn't found. Import the JSON with Tools > Import/Export Servers,\n"
-              "or pass --pgadmin-python and --pgadmin-setup.")
+        print("\npgAdmin's setup.py wasn't found, so the server wasn't added automatically.\n"
+              "Pass --pgadmin-python and --pgadmin-setup, or import the server file yourself.")
+        print_import_steps(json_path, args.group)
         return
     py, setup = found
     sqlite_path = Path(args.sqlite_path).expanduser() if args.sqlite_path else default_sqlite_path()
