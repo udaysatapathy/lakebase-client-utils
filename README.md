@@ -26,3 +26,7 @@ Contributions for other clients are welcome. DBeaver, DataGrip and others belong
 
 - The [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/), signed in with `databricks auth login --host <workspace-url> --profile <profile>`.
 - A Lakebase Autoscaling project, and a Postgres role for your Databricks identity. The project owner's role is created automatically. For other users, see [Postgres roles](https://docs.databricks.com/aws/en/oltp/projects/postgres-roles).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE).
