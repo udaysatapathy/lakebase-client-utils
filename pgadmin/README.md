@@ -75,6 +75,7 @@ Use this if you'd rather add the server in pgAdmin yourself, or if the utility c
 ## Limits
 
 - **Desktop mode only.** In pgAdmin server mode, password exec commands must be pre-defined by the administrator in `SERVER_PASSEXEC_COMMANDS`. Use `--json-only` and give the JSON to your pgAdmin admin.
+- **Reconnect after a dropped connection.** Lakebase checks the credential only at login, so an open connection keeps working after the credential expires. If the connection drops for another reason, such as the laptop sleeping or pgAdmin releasing an idle connection, **Refresh** won't bring it back. Reconnect to the server instead. pgAdmin runs the password command again and connects without a password prompt.
 - **Sign in to the CLI first.** pgAdmin can't open a browser sign-in. If the CLI session needs a fresh browser login, run `databricks auth login --profile <profile>` again.
 - **Use absolute paths.** Desktop apps don't inherit your shell's `PATH`, so the scripts use absolute paths to the CLI.
 - **Tested platforms.** Only macOS has been tested, with pgAdmin 4 9.19. The automatic setup and the `--json-only` import both connected without a password prompt. The Windows and Linux paths are written to the same design but haven't been run.
